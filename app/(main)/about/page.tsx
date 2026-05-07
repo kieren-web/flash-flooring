@@ -109,7 +109,6 @@ export default function AboutPage() {
           <div className="grid grid-cols-2 md:grid-cols-4 gap-8 text-center">
             {[
               { value: "20+", label: "Years Experience" },
-              { value: "5★", label: "Google Rating" },
               { value: "20+", label: "5-Star Reviews" },
               { value: "100%", label: "Free Quotes" },
             ].map((s) => (

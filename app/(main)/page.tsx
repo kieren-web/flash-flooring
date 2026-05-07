@@ -18,8 +18,8 @@ export const metadata: Metadata = {
 
 const stats = [
   { value: "20+", label: "Years Experience" },
-  { value: "4.6★", label: "Google Rating" },
-  { value: "25+", label: "5-Star Reviews" },
+  { value: "5★", label: "Google Rating" },
+  { value: "20+", label: "5-Star Reviews" },
   { value: "100%", label: "Free Quotes" },
 ];
 
@@ -136,7 +136,7 @@ export default function HomePage() {
             </span>
             <span className="flex items-center gap-2">
               <svg className="w-4 h-4 text-[#2563eb]" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" /></svg>
-              4.6★ on Google
+              5★ Google Reviews
             </span>
           </div>
         </div>
@@ -329,15 +329,6 @@ export default function HomePage() {
           strategy="afterInteractive"
         />
         <div className="max-w-7xl mx-auto">
-          <ScrollReveal>
-            <div className="text-center mb-10">
-              <p className="text-[#2563eb] text-sm font-semibold uppercase tracking-widest mb-3">Reviews</p>
-              <h2 className="text-3xl sm:text-4xl font-bold text-white">What Wollongong Customers Say</h2>
-              <p className="text-[#8b95a9] mt-3">
-                {siteConfig.googleReviews.rating}★ average across {siteConfig.googleReviews.count} Google reviews
-              </p>
-            </div>
-          </ScrollReveal>
           <iframe
             className="lc_reviews_widget"
             src="https://reputationhub.site/reputation/widgets/review_widget/y23ZThV4pxfYxbIYqHXQ?widgetId=69fc4691da71f9605e83c422"

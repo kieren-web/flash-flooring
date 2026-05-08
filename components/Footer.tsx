@@ -88,7 +88,18 @@ export default function Footer() {
 
         <div className="flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-[#8b95a9]">
           <p>&copy; {currentYear} Flash Flooring. All rights reserved. ABN {siteConfig.abn}</p>
-          <p>Wollongong&rsquo;s Polished Concrete & Epoxy Flooring Specialists</p>
+          <div className="flex items-center gap-4">
+            <p>Wollongong&rsquo;s Polished Concrete & Epoxy Flooring Specialists</p>
+            <span className="hidden sm:block text-[#2a3347]">|</span>
+            <a
+              href="https://axiondigital.com.au"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:text-white transition-colors whitespace-nowrap"
+            >
+              Created by Axion Digital
+            </a>
+          </div>
         </div>
       </div>
     </footer>

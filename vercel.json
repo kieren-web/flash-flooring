@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/weekly-report?secret=axion-ff-2025",
+      "schedule": "0 22 * * 0"
+    }
+  ]
+}

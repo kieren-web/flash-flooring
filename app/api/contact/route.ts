@@ -31,12 +31,12 @@ export async function POST(req: NextRequest) {
     const lastName = nameParts.slice(1).join(" ") || "";
 
     const ghlHeaders = {
-      "Authorization": `Bearer ${apiKey}`,
-      "Version": "2021-07-28",
+      Authorization: `Bearer ${apiKey}`,
+      Version: "2021-07-28",
       "Content-Type": "application/json",
     };
 
-    // Create contact in GHL
+    // ── Step 1: Create contact (or detect duplicate) ──────────────────────────
     const contactRes = await fetch("https://services.leadconnectorhq.com/contacts/", {
       method: "POST",
       headers: ghlHeaders,
@@ -48,30 +48,56 @@ export async function POST(req: NextRequest) {
         locationId,
         city: body.suburb,
         source: "flashflooring.com.au",
-        tags: ["website-lead", "flash-flooring"],
+        tags: ["flash-flooring"], // permanent identifier tag only
       }),
     });
 
     const contactData = await contactRes.json();
-    const contactId = contactData?.contact?.id;
 
-    // Add a note with service + project details
-    if (contactId) {
-      const noteLines = [
-        `Source: Flash Flooring Website`,
-        `Service Requested: ${body.service}`,
-        `Suburb: ${body.suburb}`,
-        body.message ? `Project Details: ${body.message}` : null,
-      ].filter(Boolean).join("\n");
-
-      await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
-        method: "POST",
-        headers: ghlHeaders,
-        body: JSON.stringify({ body: noteLines }),
-      });
-    } else {
-      console.error("GHL contact creation failed:", contactData);
+    // Extract contactId — from new contact or from duplicate error response
+    let contactId: string | null = contactData?.contact?.id ?? null;
+    if (!contactId && contactRes.status === 400) {
+      contactId = contactData?.meta?.contactId ?? null;
     }
+
+    if (!contactId) {
+      console.error("GHL: could not resolve contactId", contactData);
+      return NextResponse.json({ success: true }); // don't surface errors to user
+    }
+
+    // ── Step 2: Add note with full submission details ─────────────────────────
+    const noteLines = [
+      `📋 Quote Request — Flash Flooring Website`,
+      ``,
+      `Name: ${body.name}`,
+      `Phone: ${body.phone}`,
+      body.email ? `Email: ${body.email}` : null,
+      `Suburb: ${body.suburb}`,
+      `Service: ${body.service}`,
+      body.message ? `Message: ${body.message}` : null,
+    ]
+      .filter((l) => l !== null)
+      .join("\n");
+
+    await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
+      method: "POST",
+      headers: ghlHeaders,
+      body: JSON.stringify({ body: noteLines }),
+    });
+
+    // ── Step 3: Remove website-enquiry tag (ignore if not present) ────────────
+    await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+      method: "DELETE",
+      headers: ghlHeaders,
+      body: JSON.stringify({ tags: ["website-enquiry"] }),
+    });
+
+    // ── Step 4: Re-add website-enquiry tag — fires GHL trigger every time ─────
+    await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+      method: "POST",
+      headers: ghlHeaders,
+      body: JSON.stringify({ tags: ["website-enquiry"] }),
+    });
 
     return NextResponse.json({ success: true });
   } catch (err) {

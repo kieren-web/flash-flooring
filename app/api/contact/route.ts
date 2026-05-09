@@ -60,6 +60,17 @@ export async function POST(req: NextRequest) {
       contactId = contactData?.meta?.contactId ?? null;
     }
 
+    // Fallback: if GHL didn't include contactId in the 400 error, search by email or phone
+    if (!contactId && contactRes.status === 400) {
+      const searchQuery = body.email || body.phone;
+      const searchRes = await fetch(
+        `https://services.leadconnectorhq.com/contacts/search?locationId=${locationId}&query=${encodeURIComponent(searchQuery)}`,
+        { headers: ghlHeaders }
+      );
+      const searchData = await searchRes.json();
+      contactId = searchData?.contacts?.[0]?.id ?? null;
+    }
+
     if (!contactId) {
       console.error("GHL: could not resolve contactId", contactData);
       return NextResponse.json({ success: true }); // don't surface errors to user

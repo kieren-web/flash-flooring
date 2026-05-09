@@ -5,28 +5,38 @@ import Image from "next/image";
 
 const GOOGLE_REVIEW_URL = "https://g.page/r/CVtLcX767npZEAI/review";
 
-type Stage = "stars" | "private" | "thankyou-google" | "thankyou-private";
+type Stage = "stars" | "private" | "thankyou-private";
 
 export default function ReviewPage() {
   const [stage, setStage] = useState<Stage>("stars");
   const [hoveredStar, setHoveredStar] = useState(0);
+  const [selectedStar, setSelectedStar] = useState(0);
+  const [name, setName] = useState("");
+  const [contact, setContact] = useState("");
   const [feedback, setFeedback] = useState("");
-  const [submitted, setSubmitted] = useState(false);
+  const [loading, setLoading] = useState(false);
 
   function handleStarClick(star: number) {
     if (star === 5) {
-      // Redirect to Google review
       window.location.href = GOOGLE_REVIEW_URL;
     } else {
+      setSelectedStar(star);
       setStage("private");
     }
   }
 
   async function handlePrivateSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setSubmitted(true);
+    setLoading(true);
+
+    await fetch("/api/review-feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, contact, feedback, stars: selectedStar }),
+    });
+
+    setLoading(false);
     setStage("thankyou-private");
-    // Optionally POST feedback somewhere — for now just shows thank you
   }
 
   return (
@@ -101,6 +111,8 @@ export default function ReviewPage() {
                 <input
                   type="text"
                   required
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
                   className="w-full bg-[#1e2535] border border-[#2a3347] rounded-lg px-4 py-3 text-white text-sm focus:outline-none focus:border-[#2563eb]"
                   placeholder="e.g. John Smith"
                 />
@@ -110,6 +122,8 @@ export default function ReviewPage() {
                 <input
                   type="text"
                   required
+                  value={contact}
+                  onChange={(e) => setContact(e.target.value)}
                   className="w-full bg-[#1e2535] border border-[#2a3347] rounded-lg px-4 py-3 text-white text-sm focus:outline-none focus:border-[#2563eb]"
                   placeholder="0400 000 000 or email@example.com"
                 />
@@ -127,9 +141,10 @@ export default function ReviewPage() {
               </div>
               <button
                 type="submit"
-                className="w-full bg-[#2563eb] hover:bg-[#1d4ed8] text-white font-semibold py-3.5 rounded-lg transition-colors text-sm"
+                disabled={loading}
+                className="w-full bg-[#2563eb] hover:bg-[#1d4ed8] disabled:opacity-50 text-white font-semibold py-3.5 rounded-lg transition-colors text-sm"
               >
-                Send Feedback
+                {loading ? "Sending..." : "Send Feedback"}
               </button>
             </form>
           </div>

@@ -81,6 +81,15 @@ export default function ReviewPage() {
         {/* Stage: Private feedback form */}
         {stage === "private" && (
           <div>
+            <button
+              onClick={() => { setStage("stars"); setHoveredStar(0); }}
+              className="flex items-center gap-1.5 text-[#8b95a9] hover:text-white text-sm mb-6 transition-colors"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+              </svg>
+              Back
+            </button>
             <h1 className="text-2xl font-bold text-white mb-2 text-center">Thanks for the feedback</h1>
             <p className="text-[#8b95a9] mb-8 text-sm leading-relaxed text-center">
               We&apos;re sorry things weren&apos;t perfect. Tell us what happened and Gary will personally follow up.

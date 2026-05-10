@@ -83,7 +83,7 @@ async function getGA4Data(auth: ReturnType<typeof getOAuthClient>) {
         metrics: [{ name: "screenPageViews" }, { name: "sessions" }],
         dimensions: [{ name: "pagePath" }],
         orderBys: [{ metric: { metricName: "screenPageViews" }, desc: true }],
-        limit: 8,
+        limit: "8",
       },
     }),
     // New vs returning

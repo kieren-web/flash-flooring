@@ -2,15 +2,6 @@ import { NextResponse } from "next/server";
 import { google } from "googleapis";
 import nodemailer from "nodemailer";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-interface KeywordRow {
-  query: string;
-  clicks: number;
-  position: string;
-  delta: number | null; // null = new this week
-}
-
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 function getOAuthClient() {
@@ -23,408 +14,494 @@ function getOAuthClient() {
   return auth;
 }
 
-// ── GA4 Data ─────────────────────────────────────────────────────────────────
+// ── Date helpers ──────────────────────────────────────────────────────────────
+
+function fmt(d: Date) { return d.toISOString().split("T")[0]; }
+
+function getDateRanges() {
+  const today = new Date();
+  // Search Console has ~3 day lag
+  const scEnd = new Date(today); scEnd.setDate(scEnd.getDate() - 3);
+  const scStart = new Date(scEnd); scStart.setDate(scStart.getDate() - 6);
+  const scPrevEnd = new Date(scStart); scPrevEnd.setDate(scPrevEnd.getDate() - 1);
+  const scPrevStart = new Date(scPrevEnd); scPrevStart.setDate(scPrevStart.getDate() - 6);
+
+  const ga4End = new Date(today);
+  const ga4Start = new Date(today); ga4Start.setDate(ga4Start.getDate() - 6);
+  const ga4PrevStart = new Date(today); ga4PrevStart.setDate(ga4PrevStart.getDate() - 13);
+  const ga4PrevEnd = new Date(today); ga4PrevEnd.setDate(ga4PrevEnd.getDate() - 7);
+
+  return { scStart, scEnd, scPrevStart, scPrevEnd, ga4Start, ga4End, ga4PrevStart, ga4PrevEnd };
+}
+
+// ── GA4 ───────────────────────────────────────────────────────────────────────
 
 async function getGA4Data(auth: ReturnType<typeof getOAuthClient>) {
-  const analyticsData = google.analyticsdata({ version: "v1beta", auth });
-  const propertyId = process.env.GA4_PROPERTY_ID!;
+  const client = google.analyticsdata({ version: "v1beta", auth });
+  const property = `properties/${process.env.GA4_PROPERTY_ID}`;
+  const { ga4Start, ga4End, ga4PrevStart, ga4PrevEnd } = getDateRanges();
 
-  const [thisWeek, lastWeek] = await Promise.all([
-    analyticsData.properties.runReport({
-      property: `properties/${propertyId}`,
+  const [thisWeek, lastWeek, topPages, newVsReturning] = await Promise.all([
+    // This week — full metrics breakdown by channel
+    client.properties.runReport({
+      property,
       requestBody: {
-        dateRanges: [{ startDate: "7daysAgo", endDate: "today" }],
-        metrics: [{ name: "sessions" }, { name: "activeUsers" }],
+        dateRanges: [{ startDate: fmt(ga4Start), endDate: fmt(ga4End) }],
+        metrics: [
+          { name: "sessions" },
+          { name: "activeUsers" },
+          { name: "screenPageViews" },
+          { name: "engagementRate" },
+          { name: "bounceRate" },
+          { name: "averageSessionDuration" },
+          { name: "newUsers" },
+        ],
         dimensions: [{ name: "sessionDefaultChannelGroup" }],
       },
     }),
-    analyticsData.properties.runReport({
-      property: `properties/${propertyId}`,
+    // Last week — totals only for comparison
+    client.properties.runReport({
+      property,
       requestBody: {
-        dateRanges: [{ startDate: "14daysAgo", endDate: "8daysAgo" }],
+        dateRanges: [{ startDate: fmt(ga4PrevStart), endDate: fmt(ga4PrevEnd) }],
+        metrics: [
+          { name: "sessions" },
+          { name: "activeUsers" },
+          { name: "screenPageViews" },
+          { name: "engagementRate" },
+          { name: "bounceRate" },
+          { name: "averageSessionDuration" },
+          { name: "newUsers" },
+        ],
+      },
+    }),
+    // Top pages this week
+    client.properties.runReport({
+      property,
+      requestBody: {
+        dateRanges: [{ startDate: fmt(ga4Start), endDate: fmt(ga4End) }],
+        metrics: [{ name: "screenPageViews" }, { name: "sessions" }],
+        dimensions: [{ name: "pagePath" }],
+        orderBys: [{ metric: { metricName: "screenPageViews" }, desc: true }],
+        limit: 8,
+      },
+    }),
+    // New vs returning
+    client.properties.runReport({
+      property,
+      requestBody: {
+        dateRanges: [{ startDate: fmt(ga4Start), endDate: fmt(ga4End) }],
         metrics: [{ name: "sessions" }, { name: "activeUsers" }],
+        dimensions: [{ name: "newVsReturning" }],
       },
     }),
   ]);
 
-  const rows = thisWeek.data.rows || [];
-  let totalSessions = 0;
-  let totalUsers = 0;
+  // Aggregate this week totals across all channels
+  let totalSessions = 0, totalUsers = 0, totalPageViews = 0, totalNewUsers = 0;
+  let weightedEngagement = 0, weightedBounce = 0, weightedDuration = 0;
   const channelBreakdown: Record<string, number> = {};
 
-  rows.forEach((row) => {
-    const channel = row.dimensionValues?.[0]?.value || "Other";
-    const sessions = parseInt(row.metricValues?.[0]?.value || "0");
-    const users = parseInt(row.metricValues?.[1]?.value || "0");
-    totalSessions += sessions;
-    totalUsers += users;
-    channelBreakdown[channel] = sessions;
+  (thisWeek.data.rows || []).forEach(row => {
+    const ch = row.dimensionValues?.[0]?.value || "Other";
+    const s  = parseInt(row.metricValues?.[0]?.value || "0");
+    const u  = parseInt(row.metricValues?.[1]?.value || "0");
+    const pv = parseInt(row.metricValues?.[2]?.value || "0");
+    const er = parseFloat(row.metricValues?.[3]?.value || "0");
+    const br = parseFloat(row.metricValues?.[4]?.value || "0");
+    const sd = parseFloat(row.metricValues?.[5]?.value || "0");
+    const nu = parseInt(row.metricValues?.[6]?.value || "0");
+
+    totalSessions  += s;
+    totalUsers     += u;
+    totalPageViews += pv;
+    totalNewUsers  += nu;
+    weightedEngagement += er * s;
+    weightedBounce     += br * s;
+    weightedDuration   += sd * s;
+    channelBreakdown[ch] = s;
   });
 
-  const lastWeekSessions = parseInt(
-    lastWeek.data.rows?.[0]?.metricValues?.[0]?.value || "0"
-  );
-  const sessionChange =
-    lastWeekSessions > 0
-      ? Math.round(((totalSessions - lastWeekSessions) / lastWeekSessions) * 100)
-      : 0;
+  const engagementRate  = totalSessions > 0 ? (weightedEngagement / totalSessions) * 100 : 0;
+  const bounceRate      = totalSessions > 0 ? (weightedBounce / totalSessions) * 100 : 0;
+  const avgDurationSec  = totalSessions > 0 ? weightedDuration / totalSessions : 0;
+  const avgDuration     = `${Math.floor(avgDurationSec / 60)}m ${Math.round(avgDurationSec % 60)}s`;
+  const returningUsers  = totalUsers - totalNewUsers;
 
-  return { totalSessions, totalUsers, channelBreakdown, sessionChange, lastWeekSessions };
+  // Last week totals
+  let lwSessions = 0, lwUsers = 0, lwPageViews = 0, lwNewUsers = 0;
+  let lwWeightedEng = 0, lwWeightedBounce = 0, lwWeightedDur = 0;
+  (lastWeek.data.rows || []).forEach(row => {
+    const s  = parseInt(row.metricValues?.[0]?.value || "0");
+    const u  = parseInt(row.metricValues?.[1]?.value || "0");
+    const pv = parseInt(row.metricValues?.[2]?.value || "0");
+    const er = parseFloat(row.metricValues?.[3]?.value || "0");
+    const br = parseFloat(row.metricValues?.[4]?.value || "0");
+    const sd = parseFloat(row.metricValues?.[5]?.value || "0");
+    const nu = parseInt(row.metricValues?.[6]?.value || "0");
+    lwSessions += s; lwUsers += u; lwPageViews += pv; lwNewUsers += nu;
+    lwWeightedEng += er * s; lwWeightedBounce += br * s; lwWeightedDur += sd * s;
+  });
+
+  const lwEngagementRate = lwSessions > 0 ? (lwWeightedEng / lwSessions) * 100 : 0;
+  const lwBounceRate     = lwSessions > 0 ? (lwWeightedBounce / lwSessions) * 100 : 0;
+  const lwAvgDuration    = lwSessions > 0 ? lwWeightedDur / lwSessions : 0;
+
+  // % changes
+  const pct = (now: number, prev: number) => prev > 0 ? Math.round(((now - prev) / prev) * 100) : 0;
+  const sessionChange    = pct(totalSessions, lwSessions);
+  const pageViewChange   = pct(totalPageViews, lwPageViews);
+  const userChange       = pct(totalUsers, lwUsers);
+  const newUserChange    = pct(totalNewUsers, lwNewUsers);
+  const engChange        = Math.round(engagementRate - lwEngagementRate);
+  const bounceChange     = Math.round(bounceRate - lwBounceRate);
+  const durationChange   = Math.round(avgDurationSec - lwAvgDuration);
+
+  // Top pages
+  const topPagesList = (topPages.data.rows || []).map(row => ({
+    path: row.dimensionValues?.[0]?.value || "/",
+    views: parseInt(row.metricValues?.[0]?.value || "0"),
+    sessions: parseInt(row.metricValues?.[1]?.value || "0"),
+  }));
+
+  // New vs returning
+  let newSessions = 0, returningSessions = 0;
+  (newVsReturning.data.rows || []).forEach(row => {
+    const type = row.dimensionValues?.[0]?.value || "";
+    const s = parseInt(row.metricValues?.[0]?.value || "0");
+    if (type === "new") newSessions = s;
+    else returningSessions = s;
+  });
+
+  return {
+    totalSessions, totalUsers, totalPageViews, totalNewUsers, returningUsers,
+    channelBreakdown, engagementRate, bounceRate, avgDuration, avgDurationSec,
+    sessionChange, pageViewChange, userChange, newUserChange,
+    engChange, bounceChange, durationChange,
+    topPagesList, newSessions, returningSessions,
+    lastWeekSessions: lwSessions, lastWeekUsers: lwUsers, lastWeekPageViews: lwPageViews,
+  };
 }
 
-// ── Search Console Data ───────────────────────────────────────────────────────
+// ── Search Console ────────────────────────────────────────────────────────────
+
+interface KeywordRow { query: string; clicks: number; impressions: number; position: number; }
 
 async function getSearchConsoleData(auth: ReturnType<typeof getOAuthClient>) {
-  const searchConsole = google.searchconsole({ version: "v1", auth });
+  const sc = google.searchconsole({ version: "v1", auth });
   const siteUrl = process.env.SEARCH_CONSOLE_SITE_URL!;
+  const { scStart, scEnd, scPrevStart, scPrevEnd } = getDateRanges();
 
-  const today = new Date();
-
-  // This week (3-day SC lag)
-  const thisEnd = new Date(today);
-  thisEnd.setDate(thisEnd.getDate() - 3);
-  const thisStart = new Date(thisEnd);
-  thisStart.setDate(thisStart.getDate() - 6);
-
-  // Last week (same window, shifted back 7 days)
-  const lastEnd = new Date(thisEnd);
-  lastEnd.setDate(lastEnd.getDate() - 7);
-  const lastStart = new Date(thisStart);
-  lastStart.setDate(lastStart.getDate() - 7);
-
-  const fmt = (d: Date) => d.toISOString().split("T")[0];
-
-  const [overview, topQueries, lastQueries] = await Promise.all([
-    searchConsole.searchanalytics.query({
+  const [thisWeek, lastWeek, overview, prevOverview] = await Promise.all([
+    sc.searchanalytics.query({
       siteUrl,
-      requestBody: { startDate: fmt(thisStart), endDate: fmt(thisEnd), dimensions: [] },
+      requestBody: { startDate: fmt(scStart), endDate: fmt(scEnd), dimensions: ["query"], rowLimit: 10 },
     }),
-    searchConsole.searchanalytics.query({
+    sc.searchanalytics.query({
       siteUrl,
-      requestBody: {
-        startDate: fmt(thisStart),
-        endDate: fmt(thisEnd),
-        dimensions: ["query"],
-        rowLimit: 10,
-      },
+      requestBody: { startDate: fmt(scPrevStart), endDate: fmt(scPrevEnd), dimensions: ["query"], rowLimit: 10 },
     }),
-    searchConsole.searchanalytics.query({
+    sc.searchanalytics.query({
       siteUrl,
-      requestBody: {
-        startDate: fmt(lastStart),
-        endDate: fmt(lastEnd),
-        dimensions: ["query"],
-        rowLimit: 20,
-      },
+      requestBody: { startDate: fmt(scStart), endDate: fmt(scEnd), dimensions: [] },
+    }),
+    sc.searchanalytics.query({
+      siteUrl,
+      requestBody: { startDate: fmt(scPrevStart), endDate: fmt(scPrevEnd), dimensions: [] },
     }),
   ]);
 
+  const lastWeekPositions: Record<string, number> = {};
+  (lastWeek.data.rows || []).forEach(r => {
+    const q = r.keys?.[0] || "";
+    lastWeekPositions[q] = r.position || 0;
+  });
+
+  const keywords: (KeywordRow & { prevPosition: number | null; change: number | null })[] =
+    (thisWeek.data.rows || []).map(r => {
+      const query = r.keys?.[0] || "";
+      const position = r.position || 0;
+      const prevPosition = lastWeekPositions[query] ?? null;
+      const change = prevPosition !== null ? Math.round((prevPosition - position) * 10) / 10 : null;
+      return { query, clicks: Math.round(r.clicks || 0), impressions: Math.round(r.impressions || 0), position, prevPosition, change };
+    });
+
   const row = overview.data.rows?.[0];
+  const prevRow = prevOverview.data.rows?.[0];
   const clicks = Math.round(row?.clicks || 0);
   const impressions = Math.round(row?.impressions || 0);
-  const avgPosition = row?.position ? row.position.toFixed(1) : "N/A";
+  const avgPosition = row?.position ? parseFloat(row.position.toFixed(1)) : 0;
   const ctr = row?.ctr ? (row.ctr * 100).toFixed(1) + "%" : "0%";
+  const prevImpressions = Math.round(prevRow?.impressions || 0);
+  const prevAvgPosition = prevRow?.position ? parseFloat(prevRow.position.toFixed(1)) : 0;
+  const impressionChange = prevImpressions > 0
+    ? Math.round(((impressions - prevImpressions) / prevImpressions) * 100) : 0;
+  const positionChange = prevAvgPosition > 0
+    ? Math.round((prevAvgPosition - avgPosition) * 10) / 10 : 0;
 
-  // Build last-week position lookup
-  const lastWeekPositions: Record<string, number> = {};
-  (lastQueries.data.rows || []).forEach((r) => {
-    const q = r.keys?.[0] || "";
-    if (q && r.position) lastWeekPositions[q] = r.position;
-  });
-
-  const topKeywords: KeywordRow[] = (topQueries.data.rows || []).map((r) => {
-    const query = r.keys?.[0] || "";
-    const posNow = r.position ?? null;
-    const posThen = lastWeekPositions[query] ?? null;
-
-    let delta: number | null = null;
-    if (posNow !== null && posThen !== null) {
-      // Negative delta = improved (position number went down = ranked higher)
-      delta = Math.round(posNow - posThen);
-    }
-
-    return {
-      query,
-      clicks: Math.round(r.clicks || 0),
-      position: posNow ? posNow.toFixed(1) : "N/A",
-      delta,
-    };
-  });
-
-  const newKeywordsCount = topKeywords.filter((k) => k.delta === null).length;
-  const improvedCount = topKeywords.filter((k) => k.delta !== null && k.delta < -0.5).length;
-
-  return { clicks, impressions, avgPosition, ctr, topKeywords, newKeywordsCount, improvedCount };
+  return { clicks, impressions, avgPosition, ctr, keywords, impressionChange, positionChange, prevAvgPosition };
 }
 
 // ── GHL Leads ─────────────────────────────────────────────────────────────────
 
-async function getGHLLeads(): Promise<number> {
-  const apiKey = process.env.GHL_API_KEY;
-  const locationId = process.env.GHL_LOCATION_ID;
-  if (!apiKey || !locationId) return 0;
-
-  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-
+async function getGHLLeads() {
   try {
-    const res = await fetch(
-      `https://services.leadconnectorhq.com/contacts/?locationId=${locationId}&startAfterDate=${sevenDaysAgo}&limit=100`,
-      {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Version: "2021-07-28",
-        },
-      }
-    );
-    if (!res.ok) return 0;
-    const data = await res.json();
-    const contacts = data.contacts || [];
-    // Filter to only website-lead tagged contacts
-    return contacts.filter((c: { tags?: string[] }) =>
-      c.tags?.includes("website-lead")
-    ).length;
+    const apiKey = process.env.GHL_API_KEY;
+    const locationId = process.env.GHL_LOCATION_ID;
+    if (!apiKey || !locationId) return { thisWeek: 0, lastWeek: 0 };
+
+    const now = Date.now();
+    const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
+    const twoWeeksAgo = now - 14 * 24 * 60 * 60 * 1000;
+    const headers = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+
+    const [thisRes, lastRes] = await Promise.all([
+      fetch(`https://services.leadconnectorhq.com/contacts/?locationId=${locationId}&startDate=${weekAgo}&endDate=${now}&limit=100`, { headers }),
+      fetch(`https://services.leadconnectorhq.com/contacts/?locationId=${locationId}&startDate=${twoWeeksAgo}&endDate=${weekAgo}&limit=100`, { headers }),
+    ]);
+
+    const [thisData, lastData] = await Promise.all([thisRes.json(), lastRes.json()]);
+    return { thisWeek: thisData?.contacts?.length || 0, lastWeek: lastData?.contacts?.length || 0 };
   } catch {
-    return 0;
+    return { thisWeek: 0, lastWeek: 0 };
   }
 }
 
 // ── Narrative Summary ─────────────────────────────────────────────────────────
 
-function buildNarrative(
+function generateSummary(
   ga4: Awaited<ReturnType<typeof getGA4Data>>,
   sc: Awaited<ReturnType<typeof getSearchConsoleData>>,
-  leads: number
+  leads: Awaited<ReturnType<typeof getGHLLeads>>
 ): string {
   const parts: string[] = [];
 
-  // Traffic trend
-  if (ga4.lastWeekSessions === 0) {
-    parts.push(`First week of data — ${ga4.totalSessions} sessions recorded.`);
-  } else if (ga4.sessionChange >= 20) {
-    parts.push(`Strong week — traffic is up ${ga4.sessionChange}% compared to last week.`);
-  } else if (ga4.sessionChange > 0) {
-    parts.push(`Traffic up ${ga4.sessionChange}% week-on-week.`);
-  } else if (ga4.sessionChange <= -20) {
-    parts.push(`Traffic dipped ${Math.abs(ga4.sessionChange)}% this week — worth keeping an eye on.`);
-  } else if (ga4.sessionChange < 0) {
-    parts.push(`Traffic slightly down ${Math.abs(ga4.sessionChange)}% this week.`);
-  } else {
-    parts.push(`Traffic steady this week at ${ga4.totalSessions} sessions.`);
-  }
+  // Traffic
+  if (ga4.sessionChange > 20) parts.push(`Website traffic is up <strong>${ga4.sessionChange}%</strong> this week — strong growth.`);
+  else if (ga4.sessionChange > 0) parts.push(`Website traffic is up <strong>${ga4.sessionChange}%</strong> this week.`);
+  else if (ga4.sessionChange < -20) parts.push(`Website traffic dropped <strong>${Math.abs(ga4.sessionChange)}%</strong> this week — worth monitoring.`);
+  else if (ga4.sessionChange < 0) parts.push(`Website traffic is slightly down <strong>${Math.abs(ga4.sessionChange)}%</strong> vs last week.`);
+  else parts.push(`Website traffic is steady this week.`);
+
+  // Page views
+  if (ga4.pageViewChange > 0) parts.push(`Pages viewed are up <strong>${ga4.pageViewChange}%</strong> (${ga4.totalPageViews} total).`);
+  else if (ga4.pageViewChange < 0) parts.push(`Pages viewed are down <strong>${Math.abs(ga4.pageViewChange)}%</strong> (${ga4.totalPageViews} total).`);
+
+  // Engagement
+  if (ga4.engagementRate >= 60) parts.push(`Engagement rate is strong at <strong>${ga4.engagementRate.toFixed(0)}%</strong> — visitors are spending meaningful time on site.`);
+  else if (ga4.engagementRate < 40) parts.push(`Engagement rate is <strong>${ga4.engagementRate.toFixed(0)}%</strong> — may be worth reviewing page content and load speed.`);
 
   // Rankings
-  if (sc.improvedCount > 0 && sc.newKeywordsCount > 0) {
-    parts.push(`Rankings improved on ${sc.improvedCount} keyword${sc.improvedCount > 1 ? "s" : ""} and ${sc.newKeywordsCount} new term${sc.newKeywordsCount > 1 ? "s" : ""} appeared in Google.`);
-  } else if (sc.improvedCount > 0) {
-    parts.push(`Rankings improved on ${sc.improvedCount} keyword${sc.improvedCount > 1 ? "s" : ""} this week.`);
-  } else if (sc.newKeywordsCount > 0) {
-    parts.push(`${sc.newKeywordsCount} new keyword${sc.newKeywordsCount > 1 ? "s" : ""} appearing in Google Search this week.`);
-  } else if (sc.impressions > 0) {
-    parts.push(`Rankings holding steady.`);
-  }
+  if (sc.positionChange > 2) parts.push(`Google rankings improved by <strong>${sc.positionChange} positions</strong> on average — site is climbing.`);
+  else if (sc.positionChange > 0) parts.push(`Average Google ranking improved slightly by <strong>${sc.positionChange} positions</strong>.`);
+  else if (sc.positionChange < -2) parts.push(`Average ranking dropped <strong>${Math.abs(sc.positionChange)} positions</strong> — check for any new competitors.`);
+  else parts.push(`Rankings are holding steady at around position <strong>${sc.avgPosition}</strong>.`);
+
+  // Impressions
+  if (sc.impressionChange > 10) parts.push(`Impressions are up <strong>${sc.impressionChange}%</strong> — Google is showing the site to more people.`);
+  else if (sc.impressionChange < -10) parts.push(`Impressions dropped <strong>${Math.abs(sc.impressionChange)}%</strong> this week.`);
 
   // Leads
-  if (leads > 1) {
-    parts.push(`${leads} new enquiries came through the website.`);
-  } else if (leads === 1) {
-    parts.push(`1 new enquiry came through the website.`);
-  } else {
-    parts.push(`No website enquiries this week.`);
+  if (leads.thisWeek > 0) parts.push(`<strong>${leads.thisWeek} new lead${leads.thisWeek > 1 ? "s" : ""}</strong> came through the website this week.`);
+  else parts.push(`No new website leads this week.`);
+
+  // Moving keywords
+  const improving = sc.keywords.filter(k => k.change !== null && k.change > 1);
+  if (improving.length > 0) {
+    const top = improving[0];
+    parts.push(`"${top.query}" moved up <strong>${top.change} positions</strong> to #${top.position.toFixed(0)}.`);
   }
 
   return parts.join(" ");
 }
 
-// ── Action Items ──────────────────────────────────────────────────────────────
+// ── Email HTML ────────────────────────────────────────────────────────────────
 
-function buildActionItems(
-  ga4: Awaited<ReturnType<typeof getGA4Data>>,
-  sc: Awaited<ReturnType<typeof getSearchConsoleData>>,
-  leads: number
-): string[] {
-  const actions: string[] = [];
-  const avgPos = parseFloat(sc.avgPosition);
-  const organicSessions = ga4.channelBreakdown["Organic Search"] || 0;
-  const totalSessions = ga4.totalSessions || 1;
-
-  if (!isNaN(avgPos) && avgPos > 15) {
-    actions.push("Rankings still building — keep publishing suburb pages and local content to improve position.");
-  } else if (!isNaN(avgPos) && avgPos <= 10) {
-    actions.push("Solid rankings in top 10 — push for more Google reviews to lift click-through rate.");
-  }
-
-  if (organicSessions / totalSessions < 0.2 && totalSessions > 10) {
-    actions.push("Most traffic is Direct or Paid — organic search is still growing. Content and backlinks will help.");
-  }
-
-  if (leads === 0 && ga4.totalSessions > 20) {
-    actions.push("Good traffic but no leads — check the contact form is working and the CTA is visible.");
-  }
-
-  if (sc.improvedCount > 0) {
-    actions.push("Rankings trending up — maintain consistency and don't change what's working.");
-  }
-
-  if (actions.length === 0) {
-    actions.push("Stay consistent with content, reviews, and local citations. SEO compounds over time.");
-  }
-
-  return actions;
+function arrow(change: number) { return change >= 0 ? "▲" : "▼"; }
+function clr(change: number, invertGood = false) {
+  const good = invertGood ? change <= 0 : change >= 0;
+  return good ? "#4ade80" : "#f87171";
 }
 
-// ── Email HTML ────────────────────────────────────────────────────────────────
+function statCell(label: string, value: string, change: number | null, suffix = "%", invertGood = false) {
+  const changeStr = change !== null
+    ? `<p style="color:${clr(change, invertGood)};margin:0;font-size:11px;">${arrow(change)} ${Math.abs(change)}${suffix} vs last wk</p>`
+    : `<p style="margin:0;font-size:11px;color:#555;">—</p>`;
+  return `<td width="25%" style="background:#1c1c1c;border:1px solid #2e2e2e;border-radius:10px;padding:14px;text-align:center;vertical-align:top;">
+    <p style="color:#9CA3AF;margin:0 0 4px;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;">${label}</p>
+    <p style="color:#fff;margin:0 0 4px;font-size:20px;font-weight:800;">${value}</p>
+    ${changeStr}
+  </td>`;
+}
 
 function buildEmailHtml(
   ga4: Awaited<ReturnType<typeof getGA4Data>>,
   sc: Awaited<ReturnType<typeof getSearchConsoleData>>,
-  leads: number,
+  leads: Awaited<ReturnType<typeof getGHLLeads>>,
+  summary: string,
   weekLabel: string
 ) {
   const clientName = process.env.CLIENT_NAME || "Client";
-  const domain = process.env.SEARCH_CONSOLE_SITE_URL || "";
-  const narrative = buildNarrative(ga4, sc, leads);
-  const actionItems = buildActionItems(ga4, sc, leads);
-
-  const trendArrow = ga4.sessionChange >= 0 ? "▲" : "▼";
-  const trendColor = ga4.sessionChange >= 0 ? "#4ade80" : "#f87171";
+  const domain = (process.env.SEARCH_CONSOLE_SITE_URL || "").replace("sc-domain:", "").replace(/\/$/, "");
 
   const channelRows = Object.entries(ga4.channelBreakdown)
     .sort((a, b) => b[1] - a[1])
-    .map(
-      ([channel, sessions]) => `
+    .map(([ch, sessions]) => `
       <tr>
-        <td style="padding:8px 12px;border-bottom:1px solid #2a2a2a;color:#ccc;font-size:13px;">${channel}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #2a2a2a;color:#fff;text-align:right;font-size:13px;">${sessions}</td>
-      </tr>`
-    )
-    .join("");
+        <td style="padding:7px 12px;border-bottom:1px solid #2a2a2a;color:#ccc;font-size:13px;">${ch}</td>
+        <td style="padding:7px 12px;border-bottom:1px solid #2a2a2a;color:#fff;text-align:right;font-size:13px;">${sessions} sessions</td>
+      </tr>`).join("");
 
-  const keywordRows = sc.topKeywords
-    .map((k) => {
-      let deltaHtml = `<td style="padding:8px 12px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:12px;color:#555;">—</td>`;
-      if (k.delta === null) {
-        deltaHtml = `<td style="padding:8px 12px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:11px;"><span style="background:#1d3557;color:#90caf9;padding:2px 6px;border-radius:4px;">NEW</span></td>`;
-      } else if (k.delta < -0.5) {
-        deltaHtml = `<td style="padding:8px 12px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:12px;color:#4ade80;">↑ ${Math.abs(k.delta)}</td>`;
-      } else if (k.delta > 0.5) {
-        deltaHtml = `<td style="padding:8px 12px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:12px;color:#f87171;">↓ ${k.delta}</td>`;
-      }
-
-      return `
+  const keywordRows = sc.keywords.slice(0, 8).map(k => {
+    const changeStr = k.change === null
+      ? `<span style="color:#666;font-size:11px;">new</span>`
+      : k.change > 0
+        ? `<span style="color:#4ade80;font-size:11px;">▲ ${k.change}</span>`
+        : k.change < 0
+          ? `<span style="color:#f87171;font-size:11px;">▼ ${Math.abs(k.change)}</span>`
+          : `<span style="color:#666;font-size:11px;">—</span>`;
+    return `
       <tr>
-        <td style="padding:8px 12px;border-bottom:1px solid #2a2a2a;color:#ccc;font-size:13px;">${k.query}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #2a2a2a;color:#fff;text-align:right;font-size:13px;">${k.clicks}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #2a2a2a;color:#C9A870;text-align:right;font-size:13px;">#${k.position}</td>
-        ${deltaHtml}
+        <td style="padding:7px 12px;border-bottom:1px solid #2a2a2a;color:#ccc;font-size:12px;">${k.query}</td>
+        <td style="padding:7px 12px;border-bottom:1px solid #2a2a2a;color:#C9A870;text-align:center;font-size:13px;font-weight:700;">#${k.position.toFixed(0)}</td>
+        <td style="padding:7px 12px;border-bottom:1px solid #2a2a2a;text-align:center;">${changeStr}</td>
+        <td style="padding:7px 12px;border-bottom:1px solid #2a2a2a;color:#888;text-align:right;font-size:12px;">${k.impressions} imp</td>
       </tr>`;
-    })
-    .join("");
+  }).join("");
 
-  const actionRows = actionItems
-    .map(
-      (a) => `<li style="margin-bottom:8px;color:#ccc;font-size:13px;line-height:1.5;">${a}</li>`
-    )
-    .join("");
+  const topPageRows = ga4.topPagesList.map(p => {
+    const label = p.path === "/" ? "Homepage" : p.path.replace(/\/$/, "").split("/").pop()?.replace(/-/g, " ") || p.path;
+    return `
+      <tr>
+        <td style="padding:7px 12px;border-bottom:1px solid #2a2a2a;color:#ccc;font-size:12px;">${label}<span style="color:#555;font-size:10px;margin-left:6px;">${p.path}</span></td>
+        <td style="padding:7px 12px;border-bottom:1px solid #2a2a2a;color:#fff;text-align:right;font-size:13px;font-weight:600;">${p.views}</td>
+      </tr>`;
+  }).join("");
 
-  return `
-<!DOCTYPE html>
+  const newPct = ga4.newSessions + ga4.returningSessions > 0
+    ? Math.round((ga4.newSessions / (ga4.newSessions + ga4.returningSessions)) * 100) : 0;
+  const retPct = 100 - newPct;
+
+  return `<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#111;font-family:Inter,Arial,sans-serif;">
-  <div style="max-width:600px;margin:0 auto;padding:32px 16px;">
+<body style="margin:0;padding:0;background:#0f0f0f;font-family:Inter,Arial,sans-serif;">
+<div style="max-width:640px;margin:0 auto;padding:28px 16px;">
 
-    <!-- Header -->
-    <div style="background:linear-gradient(135deg,#7B35CC,#D4187A,#F05A28);border-radius:12px;padding:24px;margin-bottom:16px;text-align:center;">
-      <p style="color:rgba(255,255,255,0.8);margin:0 0 4px;font-size:13px;">Weekly Performance Report</p>
-      <h1 style="color:#fff;margin:0;font-size:22px;">${clientName}</h1>
-      <p style="color:rgba(255,255,255,0.7);margin:8px 0 0;font-size:12px;">${weekLabel} · ${domain}</p>
-    </div>
-
-    <!-- Narrative Summary -->
-    <div style="background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;padding:18px 20px;margin-bottom:16px;">
-      <p style="color:#9CA3AF;margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;">This Week</p>
-      <p style="color:#e8eaf0;margin:0;font-size:14px;line-height:1.6;">${narrative}</p>
-    </div>
-
-    <!-- Stats Row -->
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:16px;">
-      <div style="background:#1a1a1a;border:1px solid #2a2a2a;border-radius:10px;padding:14px;text-align:center;">
-        <p style="color:#9CA3AF;margin:0 0 4px;font-size:10px;text-transform:uppercase;">Sessions</p>
-        <p style="color:#fff;margin:0;font-size:22px;font-weight:700;">${ga4.totalSessions}</p>
-        <p style="color:${trendColor};margin:3px 0 0;font-size:10px;">${trendArrow} ${Math.abs(ga4.sessionChange)}% vs last wk</p>
-      </div>
-      <div style="background:#1a1a1a;border:1px solid #2a2a2a;border-radius:10px;padding:14px;text-align:center;">
-        <p style="color:#9CA3AF;margin:0 0 4px;font-size:10px;text-transform:uppercase;">Clicks</p>
-        <p style="color:#fff;margin:0;font-size:22px;font-weight:700;">${sc.clicks}</p>
-        <p style="color:#9CA3AF;margin:3px 0 0;font-size:10px;">${sc.impressions} impressions</p>
-      </div>
-      <div style="background:#1a1a1a;border:1px solid #2a2a2a;border-radius:10px;padding:14px;text-align:center;">
-        <p style="color:#9CA3AF;margin:0 0 4px;font-size:10px;text-transform:uppercase;">Avg Position</p>
-        <p style="color:#C9A870;margin:0;font-size:22px;font-weight:700;">#${sc.avgPosition}</p>
-        <p style="color:#9CA3AF;margin:3px 0 0;font-size:10px;">CTR ${sc.ctr}</p>
-      </div>
-      <div style="background:#1a1a1a;border:1px solid #2a2a2a;border-radius:10px;padding:14px;text-align:center;">
-        <p style="color:#9CA3AF;margin:0 0 4px;font-size:10px;text-transform:uppercase;">Leads</p>
-        <p style="color:${leads > 0 ? "#4ade80" : "#fff"};margin:0;font-size:22px;font-weight:700;">${leads}</p>
-        <p style="color:#9CA3AF;margin:3px 0 0;font-size:10px;">from website</p>
-      </div>
-    </div>
-
-    <!-- GA4 Channel Breakdown -->
-    <div style="background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;padding:20px;margin-bottom:16px;">
-      <h2 style="color:#fff;margin:0 0 14px;font-size:13px;text-transform:uppercase;letter-spacing:0.08em;">Traffic by Channel</h2>
-      <table style="width:100%;border-collapse:collapse;">
-        <thead>
-          <tr>
-            <th style="padding:6px 12px;text-align:left;color:#555;font-size:10px;text-transform:uppercase;font-weight:500;">Channel</th>
-            <th style="padding:6px 12px;text-align:right;color:#555;font-size:10px;text-transform:uppercase;font-weight:500;">Sessions</th>
-          </tr>
-        </thead>
-        <tbody>${channelRows}</tbody>
-      </table>
-    </div>
-
-    <!-- Keywords -->
-    <div style="background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;padding:20px;margin-bottom:16px;">
-      <h2 style="color:#fff;margin:0 0 14px;font-size:13px;text-transform:uppercase;letter-spacing:0.08em;">Google Rankings — Top Keywords</h2>
-      <table style="width:100%;border-collapse:collapse;">
-        <thead>
-          <tr>
-            <th style="padding:6px 12px;text-align:left;color:#555;font-size:10px;text-transform:uppercase;font-weight:500;">Keyword</th>
-            <th style="padding:6px 12px;text-align:right;color:#555;font-size:10px;text-transform:uppercase;font-weight:500;">Clicks</th>
-            <th style="padding:6px 12px;text-align:right;color:#555;font-size:10px;text-transform:uppercase;font-weight:500;">Position</th>
-            <th style="padding:6px 12px;text-align:right;color:#555;font-size:10px;text-transform:uppercase;font-weight:500;">Change</th>
-          </tr>
-        </thead>
-        <tbody>${keywordRows}</tbody>
-      </table>
-      <p style="color:#555;font-size:11px;margin:10px 0 0 12px;">↑ = moved up &nbsp;↓ = moved down &nbsp;NEW = first time ranking</p>
-    </div>
-
-    <!-- Action Items -->
-    <div style="background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;padding:20px;margin-bottom:24px;">
-      <h2 style="color:#fff;margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:0.08em;">Action Items</h2>
-      <ul style="margin:0;padding-left:20px;">
-        ${actionRows}
-      </ul>
-    </div>
-
-    <!-- Footer -->
-    <div style="text-align:center;padding:8px 0;">
-      <p style="color:#444;font-size:11px;margin:0;">Automated report by <a href="https://axiondigital.com.au" style="color:#7B35CC;">Axion Digital</a> · Every Monday 8am AEST</p>
-    </div>
-
+  <!-- Header -->
+  <div style="background:linear-gradient(135deg,#7B35CC,#D4187A,#F05A28);border-radius:14px;padding:28px 24px;margin-bottom:20px;">
+    <p style="color:rgba(255,255,255,0.75);margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:0.1em;">Weekly Performance Report</p>
+    <h1 style="color:#fff;margin:0 0 4px;font-size:24px;font-weight:800;">${clientName}</h1>
+    <p style="color:rgba(255,255,255,0.65);margin:0;font-size:13px;">${weekLabel} · ${domain}</p>
   </div>
+
+  <!-- Summary -->
+  <div style="background:#1c1c1c;border:1px solid #2e2e2e;border-left:3px solid #7B35CC;border-radius:10px;padding:18px 20px;margin-bottom:16px;">
+    <p style="color:#9CA3AF;margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;">This Week's Summary</p>
+    <p style="color:#e5e5e5;margin:0;font-size:14px;line-height:1.7;">${summary}</p>
+  </div>
+
+  <!-- Traffic stats row 1: Sessions, Page Views, Users, Leads -->
+  <p style="color:#666;font-size:10px;text-transform:uppercase;letter-spacing:0.08em;margin:0 0 8px;">Traffic Overview</p>
+  <table width="100%" cellpadding="0" cellspacing="6" style="margin-bottom:6px;">
+    <tr>
+      ${statCell("Sessions", String(ga4.totalSessions), ga4.sessionChange)}
+      ${statCell("Page Views", String(ga4.totalPageViews), ga4.pageViewChange)}
+      ${statCell("Visitors", String(ga4.totalUsers), ga4.userChange)}
+      ${statCell("Leads", String(leads.thisWeek), leads.thisWeek - leads.lastWeek, " from last wk")}
+    </tr>
+  </table>
+
+  <!-- Traffic stats row 2: Engagement, Bounce, Avg Duration, New Users -->
+  <table width="100%" cellpadding="0" cellspacing="6" style="margin-bottom:16px;">
+    <tr>
+      ${statCell("Engagement", ga4.engagementRate.toFixed(0) + "%", ga4.engChange, "pp")}
+      ${statCell("Bounce Rate", ga4.bounceRate.toFixed(0) + "%", ga4.bounceChange, "pp", true)}
+      ${statCell("Avg Duration", ga4.avgDuration, ga4.durationChange, "s")}
+      ${statCell("New Visitors", String(ga4.totalNewUsers), ga4.newUserChange)}
+    </tr>
+  </table>
+
+  <!-- New vs Returning -->
+  <div style="background:#1c1c1c;border:1px solid #2e2e2e;border-radius:10px;padding:18px 20px;margin-bottom:16px;">
+    <p style="color:#fff;margin:0 0 14px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;">New vs Returning Visitors</p>
+    <!-- Bar -->
+    <div style="background:#2a2a2a;border-radius:4px;overflow:hidden;height:10px;margin-bottom:10px;">
+      <div style="background:linear-gradient(135deg,#7B35CC,#D4187A);height:10px;width:${newPct}%;float:left;"></div>
+      <div style="background:#2a4a2a;height:10px;width:${retPct}%;float:left;"></div>
+    </div>
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="color:#ccc;font-size:13px;"><span style="display:inline-block;width:10px;height:10px;background:linear-gradient(135deg,#7B35CC,#D4187A);border-radius:2px;margin-right:6px;vertical-align:middle;"></span>New — ${ga4.newSessions} sessions (${newPct}%)</td>
+        <td style="color:#ccc;font-size:13px;text-align:right;"><span style="display:inline-block;width:10px;height:10px;background:#2a4a2a;border:1px solid #4ade80;border-radius:2px;margin-right:6px;vertical-align:middle;"></span>Returning — ${ga4.returningSessions} sessions (${retPct}%)</td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- Top pages -->
+  <div style="background:#1c1c1c;border:1px solid #2e2e2e;border-radius:10px;padding:18px 20px;margin-bottom:16px;">
+    <p style="color:#fff;margin:0 0 14px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;">Top Pages <span style="color:#666;font-size:11px;font-weight:400;text-transform:none;">by page views</span></p>
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <thead>
+        <tr>
+          <th style="padding:6px 12px;text-align:left;color:#555;font-size:10px;text-transform:uppercase;">Page</th>
+          <th style="padding:6px 12px;text-align:right;color:#555;font-size:10px;text-transform:uppercase;">Views</th>
+        </tr>
+      </thead>
+      <tbody>${topPageRows}</tbody>
+    </table>
+  </div>
+
+  <!-- Keyword rankings -->
+  <div style="background:#1c1c1c;border:1px solid #2e2e2e;border-radius:10px;padding:18px 20px;margin-bottom:16px;">
+    <p style="color:#fff;margin:0 0 14px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;">Keyword Rankings <span style="color:#666;font-size:11px;font-weight:400;text-transform:none;">vs last week</span></p>
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <thead>
+        <tr>
+          <th style="padding:6px 12px;text-align:left;color:#555;font-size:10px;text-transform:uppercase;">Keyword</th>
+          <th style="padding:6px 12px;text-align:center;color:#555;font-size:10px;text-transform:uppercase;">Rank</th>
+          <th style="padding:6px 12px;text-align:center;color:#555;font-size:10px;text-transform:uppercase;">Change</th>
+          <th style="padding:6px 12px;text-align:right;color:#555;font-size:10px;text-transform:uppercase;">Impressions</th>
+        </tr>
+      </thead>
+      <tbody>${keywordRows}</tbody>
+    </table>
+  </div>
+
+  <!-- Search Console overview -->
+  <table width="100%" cellpadding="0" cellspacing="6" style="margin-bottom:16px;">
+    <tr>
+      ${statCell("SC Impressions", String(sc.impressions), sc.impressionChange)}
+      ${statCell("SC Clicks", String(sc.clicks), null)}
+      ${statCell("Avg Position", "#" + sc.avgPosition, sc.positionChange, " pos", true)}
+      ${statCell("Click-Through", sc.ctr, null)}
+    </tr>
+  </table>
+
+  <!-- Traffic sources -->
+  <div style="background:#1c1c1c;border:1px solid #2e2e2e;border-radius:10px;padding:18px 20px;margin-bottom:16px;">
+    <p style="color:#fff;margin:0 0 14px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;">Traffic Sources</p>
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <tbody>${channelRows}</tbody>
+    </table>
+  </div>
+
+  <!-- Footer -->
+  <div style="text-align:center;padding:16px 0 8px;">
+    <p style="color:#444;font-size:11px;margin:0;">Automated weekly report by <a href="https://axiondigital.com.au" style="color:#7B35CC;text-decoration:none;">Axion Digital</a> · Every Monday 8am AEST</p>
+    <p style="color:#333;font-size:10px;margin:6px 0 0;">Reply to this email to reach Kieren · kieren@axiondigital.com.au</p>
+  </div>
+
+</div>
 </body>
 </html>`;
 }
 
-// ── Main Handler ──────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const secret = searchParams.get("secret");
-  if (secret !== process.env.CRON_SECRET) {
+  if (searchParams.get("secret") !== process.env.CRON_SECRET) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -436,20 +513,13 @@ export async function GET(request: Request) {
       getGHLLeads(),
     ]);
 
-    const weekLabel = new Date().toLocaleDateString("en-AU", {
-      day: "numeric",
-      month: "long",
-      year: "numeric",
-    });
-
-    const html = buildEmailHtml(ga4, sc, leads, weekLabel);
+    const weekLabel = new Date().toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" });
+    const summary = generateSummary(ga4, sc, leads);
+    const html = buildEmailHtml(ga4, sc, leads, summary, weekLabel);
 
     const transporter = nodemailer.createTransport({
       service: "gmail",
-      auth: {
-        user: process.env.REPORTING_GMAIL,
-        pass: process.env.GMAIL_APP_PASSWORD,
-      },
+      auth: { user: process.env.REPORTING_GMAIL, pass: process.env.GMAIL_APP_PASSWORD },
     });
 
     await transporter.sendMail({
@@ -459,7 +529,7 @@ export async function GET(request: Request) {
       html,
     });
 
-    return NextResponse.json({ success: true, weekLabel, ga4, sc, leads });
+    return NextResponse.json({ success: true, weekLabel, summary, ga4, sc, leads });
   } catch (err) {
     console.error("Weekly report error:", err);
     return NextResponse.json({ error: String(err) }, { status: 500 });
